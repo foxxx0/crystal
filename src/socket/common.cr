@@ -8,6 +8,7 @@
   require "c/arpa/inet"
   require "c/sys/un"
   require "c/netinet/in"
+  require "c/net/if"
 {% end %}
 
 class Socket < IO
