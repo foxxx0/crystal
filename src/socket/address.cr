@@ -90,6 +90,7 @@ class Socket
     BROADCAST6   = "ff0X::1"
 
     getter port : Int32
+    getter scope_id : UInt32
 
     @addr : LibC::In6Addr | LibC::InAddr
 
@@ -109,10 +110,20 @@ class Socket
     def self.new(address : String, port : Int32)
       raise Error.new("Invalid port number: #{port}") unless IPAddress.valid_port?(port)
 
-      if v4_fields = parse_v4_fields?(address)
+      addr_part, _, scope_part = address.partition('%')
+      if v4_fields = parse_v4_fields?(addr_part)
         addr = v4(v4_fields, port.to_u16!)
-      elsif v6_fields = parse_v6_fields?(address)
-        addr = v6(v6_fields, port.to_u16!)
+      elsif v6_fields = parse_v6_fields?(addr_part)
+        # `scope_id` is only relevant for link-local addresses, i.e. beginning with "fe80:".
+        scope_id = 0u32
+        if v6_fields[0] == 0xfe80 && !scope_part.empty?
+          # Scope can be given either as a network interface name or directly as the interface index.
+          # When given a name we need to find the corresponding interface index.
+          scope_id_parsed = scope_part.to_u32? || LibC.if_nametoindex(scope_part).not_nil!
+          raise Error.new("Invalid IPv6 link-local scope identifier #{scope_part} in address #{address}") unless scope_id_parsed.positive?
+          scope_id = scope_id_parsed
+        end
+        addr = v6(v6_fields, port.to_u16!, scope_id)
       else
         raise Error.new("Invalid IP address: #{address}")
       end
@@ -364,14 +375,15 @@ class Socket
       0 <= field <= 0xff ? field.to_u8! : raise Error.new("Invalid IPv4 field: #{field}")
     end
 
-    # Returns the IPv6 address with the given address *fields* and *port*
-    # number.
-    def self.v6(fields : UInt16[8], port : UInt16) : self
+    # Returns the IPv6 address with the given address *fields*, *port* number
+    # and scope identifier.
+    def self.v6(fields : UInt16[8], port : UInt16, scope_id : UInt32 = 0u32) : self
       fields.map! { |field| endian_swap(field) }
       addr = LibC::SockaddrIn6.new(
         sin6_family: LibC::AF_INET6,
         sin6_port: endian_swap(port),
         sin6_addr: ipv6_from_addr16(fields),
+        sin6_scope_id: scope_id,
       )
       new(pointerof(addr), sizeof(typeof(addr)))
     end
@@ -379,10 +391,10 @@ class Socket
     # Returns the IPv6 address `[x0:x1:x2:x3:x4:x5:x6:x7]:port`.
     #
     # Raises `Socket::Error` if any field or the port number is out of range.
-    def self.v6(x0 : Int, x1 : Int, x2 : Int, x3 : Int, x4 : Int, x5 : Int, x6 : Int, x7 : Int, *, port : Int) : self
+    def self.v6(x0 : Int, x1 : Int, x2 : Int, x3 : Int, x4 : Int, x5 : Int, x6 : Int, x7 : Int, *, port : Int, scope_id : UInt32 = 0u32) : self
       fields = StaticArray[x0, x1, x2, x3, x4, x5, x6, x7].map { |field| to_v6_field(field) }
       port = valid_port?(port) ? port.to_u16! : raise Error.new("Invalid port number: #{port}")
-      v6(fields, port)
+      v6(fields, port, scope_id)
     end
 
     private def self.to_v6_field(field)
@@ -435,12 +447,14 @@ class Socket
     protected def initialize(sockaddr : LibC::SockaddrIn6*, @size)
       @family = Family::INET6
       @addr = sockaddr.value.sin6_addr
+      @scope_id = sockaddr.value.sin6_scope_id
       @port = IPAddress.endian_swap(sockaddr.value.sin6_port).to_i
     end
 
     protected def initialize(sockaddr : LibC::SockaddrIn*, @size)
       @family = Family::INET
       @addr = sockaddr.value.sin_addr
+      @scope_id = 0u32
       @port = IPAddress.endian_swap(sockaddr.value.sin_port).to_i
     end
 
@@ -717,6 +731,11 @@ class Socket
       sockaddr.value.sin6_family = family
       sockaddr.value.sin6_port = IPAddress.endian_swap(port.to_u16!)
       sockaddr.value.sin6_addr = addr
+      if @family == Family::INET6 && link_local?
+        sockaddr.value.sin6_scope_id = @scope_id
+      else
+        sockaddr.value.sin6_scope_id = 0
+      end
       sockaddr.as(LibC::Sockaddr*)
     end
 
